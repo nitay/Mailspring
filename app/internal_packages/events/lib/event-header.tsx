@@ -2,6 +2,7 @@ import { RetinaImg } from 'mailspring-component-kit';
 
 import React from 'react';
 import fs from 'fs';
+import { ipcRenderer } from 'electron';
 import {
   Rx,
   Actions,
@@ -57,6 +58,27 @@ export function renderLocation(location: string | undefined): React.ReactNode {
   return nodes;
 }
 
+/**
+ * The VEVENT of a synced calendar object that an invitation is about. An invitation for one
+ * occurrence of a series names it by RECURRENCE-ID; the object's first VEVENT is the series.
+ *
+ * @returns null when the invitation names an occurrence the object has no VEVENT for.
+ */
+export function eventForInvitation(
+  calendarIcs: string,
+  recurrenceIdStart: number | undefined
+): ICAL.Event | null {
+  const { root, event } = CalendarUtils.parseICSString(calendarIcs);
+  if (recurrenceIdStart === undefined) {
+    return event;
+  }
+  const occurrence = root.getAllSubcomponents('vevent').find((vevent) => {
+    const rid = vevent.getFirstPropertyValue('recurrence-id') as ICAL.Time | null;
+    return rid && rid.toJSDate().getTime() / 1000 === recurrenceIdStart;
+  });
+  return occurrence ? new ICAL.Event(occurrence) : null;
+}
+
 interface EventHeaderProps {
   message: Message;
   file: File;
@@ -66,6 +88,9 @@ interface EventHeaderState {
   icsOriginalData?: string;
   icsMethod?: 'reply' | 'request' | 'cancel';
   icsEvent?: ICAL.Event;
+  isOnCalendar?: boolean;
+  /** Set when the emailed invitation is about one occurrence of a series, in unix seconds. */
+  inviteRecurrenceIdStart?: number;
   inflight?: ICSParticipantStatus;
 }
 
@@ -86,6 +111,7 @@ export class EventHeader extends React.Component<EventHeaderProps, EventHeaderSt
     icsEvent: undefined,
     icsMethod: undefined,
     icsOriginalData: undefined,
+    isOnCalendar: false,
     inflight: undefined,
   };
 
@@ -122,10 +148,14 @@ export class EventHeader extends React.Component<EventHeaderProps, EventHeaderSt
       // Normalize to known methods: request, reply, cancel. Default unknown methods to request.
       const normalizedMethod =
         methodLower === 'reply' || methodLower === 'cancel' ? methodLower : 'request';
+      const inviteRecurrenceIdStart = event.recurrenceId
+        ? event.recurrenceId.toJSDate().getTime() / 1000
+        : undefined;
       this.setState({
         icsEvent: event,
         icsMethod: normalizedMethod as 'reply' | 'request' | 'cancel',
         icsOriginalData: data.toString(),
+        inviteRecurrenceIdStart,
       });
 
       this._subscription = Rx.Observable.fromQuery(
@@ -134,12 +164,19 @@ export class EventHeader extends React.Component<EventHeaderProps, EventHeaderSt
           accountId: message.accountId,
         })
       ).subscribe((calEvent) => {
-        if (!this._mounted || !calEvent) return;
+        if (!this._mounted) return;
+        this.setState({ isOnCalendar: !!calEvent });
+        if (!calEvent) return;
         try {
-          this.setState({
-            icsEvent: CalendarUtils.parseICSString(calEvent.ics).event,
-            icsOriginalData: calEvent.ics,
-          });
+          const synced = eventForInvitation(calEvent.ics, inviteRecurrenceIdStart);
+          if (!synced) return;
+          // The reply is built from icsOriginalData. For one occurrence that stays the emailed
+          // copy, which describes it alone; the calendar object would answer for the series.
+          this.setState(
+            inviteRecurrenceIdStart === undefined
+              ? { icsEvent: synced, icsOriginalData: calEvent.ics }
+              : { icsEvent: synced }
+          );
         } catch (e) {
           console.warn(`EventHeader: Could not parse ICS data from calendar event: ${e.message}`);
         }
@@ -213,6 +250,11 @@ export class EventHeader extends React.Component<EventHeaderProps, EventHeaderSt
               <div className="event-time">{time}</div>
             </div>
             <div className="event-location">{renderLocation(icsEvent.location)}</div>
+            {this.state.isOnCalendar && (
+              <div className="event-view-in-calendar">
+                <a onClick={this._onViewInCalendar}>{localized('View in Calendar')}</a>
+              </div>
+            )}
             {icsMethod === 'cancel'
               ? this._renderCancellation()
               : icsMethod === 'request'
@@ -223,6 +265,14 @@ export class EventHeader extends React.Component<EventHeaderProps, EventHeaderSt
       </div>
     );
   }
+
+  _onViewInCalendar = () => {
+    ipcRenderer.send('command', 'application:show-calendar', {
+      icsuid: this.state.icsEvent.uid,
+      accountId: this.props.message.accountId,
+      recurrenceIdStart: this.state.inviteRecurrenceIdStart,
+    });
+  };
 
   _renderSenderResponse() {
     const { icsEvent } = this.state;
