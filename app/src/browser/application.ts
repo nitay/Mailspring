@@ -10,6 +10,7 @@ import {
   ipcMain,
   dialog,
   nativeImage,
+  powerMonitor,
   shell,
 } from 'electron';
 
@@ -34,6 +35,8 @@ import moveToApplications from './move-to-applications';
 import { MailsyncProcess } from '../mailsync-process';
 import Config from '../config';
 import { registerQuickpreviewIPCHandlers } from './quickpreview-ipc';
+import { guardAuxiliaryWindowNavigation } from './auxiliary-window-guard';
+import { isMailspringWindowContents } from './mailspring-window';
 import {
   handleWindowsToastXMLProtocolAction,
   registerNotificationIPCHandlers,
@@ -69,6 +72,7 @@ export default class Application extends EventEmitter {
   _initialized = false;
   _pendingLaunchOptions: any[] = [];
   _pendingUrls: string[] = [];
+  _pendingCalendarFocus: unknown;
 
   async start(options) {
     const { resourcePath, configDirPath, version, devMode, specMode, safeMode } = options;
@@ -150,6 +154,7 @@ export default class Application extends EventEmitter {
     await this.oneTimeMoveToApplications();
     await this.oneTimeAddToDock();
 
+    guardAuxiliaryWindowNavigation();
     this.autoUpdateManager = new AutoUpdateManager(version, config, specMode);
     this.applicationMenu = new ApplicationMenu(version);
     this.windowManager = new WindowManager({
@@ -441,9 +446,27 @@ export default class Application extends EventEmitter {
       }
     });
 
-    this.on('application:show-calendar', () => {
+    // `focusEvent` names an event to show; the menu item passes none. For a window that is not
+    // open yet it is held until the calendar reports it has mounted: the window is made from
+    // the hot window, which counts as loaded before then, so a message sent now is dropped.
+    this.on('application:show-calendar', (focusEvent?: unknown) => {
+      const open = this.windowManager.get(WindowManager.CALENDAR_WINDOW);
       this.windowManager.ensureWindow(WindowManager.CALENDAR_WINDOW, {});
       this.sendCalendarSync();
+      if (!open || (focusEvent && this._pendingCalendarFocus)) {
+        // New window, or one still mounting: the latest event asked for is the one to show.
+        this._pendingCalendarFocus = focusEvent;
+      } else if (focusEvent) {
+        open.sendMessage('focus-calendar-event', focusEvent);
+      }
+    });
+
+    this.on('application:calendar-mounted', () => {
+      if (!this._pendingCalendarFocus) return;
+      this.windowManager
+        .get(WindowManager.CALENDAR_WINDOW)
+        .sendMessage('focus-calendar-event', this._pendingCalendarFocus);
+      this._pendingCalendarFocus = undefined;
     });
 
     // The calendar window's MailsyncBridge has no sync clients, so a manual
@@ -692,6 +715,17 @@ export default class Application extends EventEmitter {
       }
     });
 
+    // The sync engine's retry wait only counts awake time, so after sleep it can sit out
+    // its full 120s interval before reconnecting unless the main window wakes it.
+    const onSystemResumed = () => {
+      const main = this.windowManager.get(WindowManager.MAIN_WINDOW);
+      if (main) {
+        main.sendMessage('system-resumed');
+      }
+    };
+    powerMonitor.on('resume', onSystemResumed);
+    powerMonitor.on('unlock-screen', onSystemResumed);
+
     app.on('activate', (event, hasVisibleWindows) => {
       if (!hasVisibleWindows) {
         this.ensureWindowsForTokenState();
@@ -707,10 +741,13 @@ export default class Application extends EventEmitter {
     });
 
     ipcMain.on('command', (event, command, ...args) => {
+      if (!isMailspringWindowContents(event.sender)) return;
+      if (typeof command !== 'string' || !command.startsWith('application:')) return;
       this.emit(command, ...args);
     });
 
     ipcMain.on('window-command', (event, command, ...args) => {
+      if (!isMailspringWindowContents(event.sender)) return;
       const win = BrowserWindow.fromWebContents(event.sender);
       if (!win) return;
       win.emit(command, ...args);
@@ -1005,7 +1042,15 @@ export default class Application extends EventEmitter {
       return;
     }
 
-    const parts = url.parse(urlToOpen, true);
+    // url.parse throws on malformed input, and the URL comes from whatever app
+    // launched us (MAILSPRING-CLIENT-M2).
+    let parts: url.UrlWithParsedQuery;
+    try {
+      parts = url.parse(urlToOpen, true);
+    } catch (err) {
+      console.warn(`Ignoring URL - could not parse ${urlToOpen}: ${err.message}`);
+      return;
+    }
     const main = this.windowManager.get(WindowManager.MAIN_WINDOW);
 
     if (!main) {
