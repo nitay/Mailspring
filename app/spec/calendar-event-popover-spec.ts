@@ -1,4 +1,4 @@
-import { Actions, DatabaseStore, SyncbackEventTask } from 'mailspring-exports';
+import { AccountStore, Actions, DatabaseStore, SyncbackEventTask } from 'mailspring-exports';
 import { Event as MailspringEvent } from '../src/flux/models/event';
 import { CalendarEventPopover } from '../internal_packages/main-calendar/lib/core/calendar-event-popover';
 import { TimedOccurrence } from '../internal_packages/main-calendar/lib/core/calendar-data-source';
@@ -32,6 +32,31 @@ DTSTART:20260303T140000Z
 DTEND:20260303T150000Z
 RDATE:20260310T140000Z,20260324T140000Z
 SUMMARY:Board meeting
+DTSTAMP:20260101T000000Z
+SEQUENCE:0
+END:VEVENT
+END:VCALENDAR`;
+
+// A Berlin series as Google writes it, for the zone picker.
+const BERLIN_ICS = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VTIMEZONE
+TZID:Europe/Berlin
+BEGIN:STANDARD
+DTSTART:19700101T000000
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0100
+TZNAME:CET
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:berlin@test
+DTSTART;TZID=Europe/Berlin:20260303T150000
+DTEND;TZID=Europe/Berlin:20260303T160000
+RRULE:FREQ=WEEKLY
+EXDATE;TZID=Europe/Berlin:20260310T150000
+SUMMARY:Standup
 DTSTAMP:20260101T000000Z
 SEQUENCE:0
 END:VEVENT
@@ -90,6 +115,18 @@ function rruleOf(ics: string): string | undefined {
   return (/^RRULE:(.*)$/m.exec(ics) || [])[1];
 }
 
+/** SEQUENCE of each VEVENT in file order; null where a VEVENT has none. */
+function sequencesOf(ics: string): (number | null)[] {
+  return ics
+    .replace(/\r\n[ \t]/g, '')
+    .split('BEGIN:VEVENT')
+    .slice(1)
+    .map((v) => {
+      const m = /^SEQUENCE:(\d+)$/m.exec(v);
+      return m ? parseInt(m[1], 10) : null;
+    });
+}
+
 describe('CalendarEventPopover save path and the recurrence rule', function () {
   let queued: any[];
 
@@ -126,6 +163,21 @@ describe('CalendarEventPopover save path and the recurrence rule', function () {
     expect(queued[0].event.ics).toContain('RDATE:20260310T140000Z,20260324T140000Z');
   });
 
+  it('rezones a series when the zone picker changed, and brings its EXDATEs along', async function () {
+    const event = makeEvent(BERLIN_ICS);
+    const popover = await openEditor(event, 'Standup');
+    expect(popover.state.timezone).toBe('Europe/Berlin');
+    popover.updateField('timezone', 'America/Chicago');
+
+    popover._saveAllOccurrences(event);
+
+    const ics = queued[0].event.ics;
+    expect(ics).toContain('DTSTART;TZID=America/Chicago:20260303T080000');
+    expect(ics).toContain('EXDATE;TZID=America/Chicago:20260310T080000');
+    expect(ics).toContain('TZID:America/Chicago');
+    expect(ics).not.toContain('TZID:Europe/Berlin');
+  });
+
   it('still writes the rule the user picked when the Repeat control changed', async function () {
     const event = makeEvent(FORTNIGHTLY_ICS);
     const popover = await openEditor(event, 'Planning');
@@ -135,5 +187,82 @@ describe('CalendarEventPopover save path and the recurrence rule', function () {
 
     expect(queued.length).toBe(1);
     expect(rruleOf(queued[0].event.ics)).toBe('FREQ=DAILY');
+  });
+});
+
+describe('CalendarEventPopover save path and SEQUENCE', function () {
+  let queued: any[];
+
+  beforeEach(function () {
+    queued = [];
+    spyOn(Actions, 'queueTask').andCallFake((task) => queued.push(task));
+    spyOn(SyncbackEventTask, 'forUpdating').andCallFake((opts) => opts);
+  });
+
+  it('revises the series once however many fields one save changed', async function () {
+    const event = makeEvent(FORTNIGHTLY_ICS);
+    const popover = await openEditor(event, 'Planning');
+    popover.updateField('title', 'Planning (renamed)');
+    popover.updateField('repeat', 'daily');
+    popover.updateStart(START + 3600);
+
+    popover._saveAllOccurrences(event);
+
+    expect(sequencesOf(queued[0].event.ics)).toEqual([1]);
+  });
+
+  it('revises a series that never carried a SEQUENCE', async function () {
+    const event = makeEvent(FORTNIGHTLY_ICS.replace('SEQUENCE:0\n', ''));
+    const popover = await openEditor(event, 'Planning');
+    popover.updateField('title', 'Planning (renamed)');
+
+    popover._saveAllOccurrences(event);
+
+    expect(sequencesOf(queued[0].event.ics)).toEqual([1]);
+  });
+
+  it('revises only the occurrence when one occurrence is edited', async function () {
+    const event = makeEvent(FORTNIGHTLY_ICS);
+    const popover = await openEditor(event, 'Planning');
+    popover.updateStart(START + 3600);
+
+    await popover._saveOccurrenceException(event);
+
+    expect(sequencesOf(queued[0].event.ics)).toEqual([0, 1]);
+  });
+});
+
+describe('CalendarEventPopover save path and the organizer', function () {
+  let queued: any[];
+
+  beforeEach(function () {
+    queued = [];
+    spyOn(Actions, 'queueTask').andCallFake((task) => queued.push(task));
+    spyOn(SyncbackEventTask, 'forUpdating').andCallFake((opts) => opts);
+    spyOn(AccountStore, 'accountForId').andReturn({ emailAddress: 'me@example.com', name: 'Me' });
+  });
+
+  it('names the account as organizer when the first guest is added to the series', async function () {
+    const event = makeEvent(FORTNIGHTLY_ICS);
+    const popover = await openEditor(event, 'Planning');
+    popover.updateAttendees([{ email: 'bo@example.com', name: 'Bo' }]);
+
+    popover._saveAllOccurrences(event);
+
+    expect(queued[0].event.ics).toContain('ORGANIZER;CN=Me:mailto:me@example.com');
+  });
+
+  it('names the account as organizer when the first guest is added to one occurrence', async function () {
+    const event = makeEvent(FORTNIGHTLY_ICS);
+    const popover = await openEditor(event, 'Planning');
+    popover.updateAttendees([{ email: 'bo@example.com', name: 'Bo' }]);
+
+    await popover._saveOccurrenceException(event);
+
+    const vevents = queued[0].event.ics.split('BEGIN:VEVENT').slice(1);
+    expect(vevents.length).toBe(2);
+    for (const vevent of vevents) {
+      expect(vevent).toContain('ORGANIZER;CN=Me:mailto:me@example.com');
+    }
   });
 });
