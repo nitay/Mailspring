@@ -46,10 +46,20 @@ export class MonthViewEvent extends React.Component<MonthViewEventProps, MonthVi
 
   componentDidMount() {
     this._revealOnFocusGained(false);
+    this._takeFocusIfSelected();
   }
 
   componentDidUpdate(prevProps: MonthViewEventProps) {
     this._revealOnFocusGained(prevProps.focused);
+    this._takeFocusIfSelected();
+  }
+
+  // See CalendarEvent._takeFocusIfSelected.
+  _takeFocusIfSelected() {
+    if (!this.props.selected || document.activeElement !== document.body) {
+      return;
+    }
+    (ReactDOM.findDOMNode(this) as HTMLElement | null)?.focus({ preventScroll: true });
   }
 
   // Announce focus only as it arrives: onFocused opens the card and the reveal scrolls to it, so
@@ -136,8 +146,10 @@ export class MonthViewEvent extends React.Component<MonthViewEventProps, MonthVi
       return;
     }
 
-    // Prevent text selection during drag
+    // Prevent text selection during drag. That also stops the browser focusing the event, so take
+    // focus here; preventScroll keeps a half-hidden event under the pointer for the drag.
     e.preventDefault();
+    e.currentTarget.focus({ preventScroll: true });
     // Note: Don't call stopPropagation() - the event needs to bubble to
     // CalendarEventContainer so it can track _mouseIsDown state
 
