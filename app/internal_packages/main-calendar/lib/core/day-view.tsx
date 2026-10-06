@@ -250,6 +250,7 @@ export class DayView extends React.Component<
           onCalendarMouseMove={this.props.onCalendarMouseMove}
           onCalendarClick={this.props.onCalendarClick}
           onCalendarDoubleClick={this.props.onCalendarDoubleClick}
+          onCalendarContextMenu={this.props.onCalendarContextMenu}
         >
           <div className="top-banner">
             {/* Role follows pattern: Calendar:{ViewName}:Banner (cf. WeekView's Calendar:Week:Banner) */}
@@ -299,6 +300,7 @@ export class DayView extends React.Component<
                   selectedEvents={this.props.selectedEvents}
                   onEventClick={this.props.onEventClick}
                   onEventDoubleClick={this.props.onEventDoubleClick}
+                  onEventContextMenu={this.props.onEventContextMenu}
                   onEventFocused={this.props.onEventFocused}
                   dragState={this.props.dragState}
                   onEventDragStart={this.props.onEventDragStart}
@@ -326,6 +328,7 @@ export class DayView extends React.Component<
                       selectedEvents={this.props.selectedEvents}
                       onEventClick={this.props.onEventClick}
                       onEventDoubleClick={this.props.onEventDoubleClick}
+                      onEventContextMenu={this.props.onEventContextMenu}
                       onEventFocused={this.props.onEventFocused}
                       dragState={this.props.dragState}
                       onEventDragStart={this.props.onEventDragStart}
